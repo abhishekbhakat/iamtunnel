@@ -1,199 +1,300 @@
+import Darwin
 import Foundation
 
-class TunnelManager: ObservableObject {
+@MainActor
+final class TunnelManager: ObservableObject {
     static let shared = TunnelManager()
 
-    private var pids: [UUID: Int32] = [:]
+    private struct ProcessIdentity: Codable, Equatable {
+        let pid: Int32
+        let startSeconds: UInt64
+        let startMicroseconds: UInt64
 
-    // ── Connect ──────────────────────────────────────────────
+        static func read(_ pid: Int32) -> Self? {
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout.size(ofValue: info))
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size,
+                  info.pbi_pgid == UInt32(pid) else { return nil }
+            return Self(pid: pid, startSeconds: info.pbi_start_tvsec, startMicroseconds: info.pbi_start_tvusec)
+        }
+
+        var isCurrent: Bool { Self.read(pid) == self }
+    }
+
+    private final class Session {
+        let tunnel: Tunnel
+        let onStatusChange: (TunnelStatus) -> Void
+        var keepAlive: Bool
+        var process: Process?
+        var restored: ProcessIdentity?
+        var exitSource: DispatchSourceProcess?
+        var work: Task<Void, Never>?
+        var retryPending = false
+
+        init(tunnel: Tunnel, onStatusChange: @escaping (TunnelStatus) -> Void) {
+            self.tunnel = tunnel
+            self.keepAlive = tunnel.keepAlive
+            self.onStatusChange = onStatusChange
+        }
+
+        var id: UUID { tunnel.id }
+        var pid: Int32? { process?.processIdentifier ?? restored?.pid }
+    }
+
+    private let retainedKey = "retainedTunnelProcesses"
+    private lazy var retained: [String: ProcessIdentity] = {
+        guard let data = UserDefaults.appDefaults.data(forKey: retainedKey) else { return [:] }
+        return (try? JSONDecoder().decode([String: ProcessIdentity].self, from: data)) ?? [:]
+    }()
+    private var sessions: [UUID: Session] = [:]
+    private var isShuttingDown = false
+
     func connect(tunnel: Tunnel, onStatusChange: @escaping (TunnelStatus) -> Void) {
-        guard pids[tunnel.id] == nil else { return }
+        guard !isShuttingDown, sessions[tunnel.id] == nil else { return }
+        let session = Session(tunnel: tunnel, onStatusChange: onStatusChange)
+        sessions[tunnel.id] = session
+        session.onStatusChange(.starting)
+        start(session, retrying: false)
+    }
 
-        onStatusChange(.starting)
+    func updateKeepAlive(for tunnel: Tunnel) {
+        guard let session = sessions[tunnel.id] else { return }
+        let endpointChanged = (session.keepAlive || tunnel.keepAlive) && !session.tunnel.usesSameEndpoint(as: tunnel)
+        session.keepAlive = tunnel.keepAlive
+        if endpointChanged || (!session.keepAlive && session.retryPending) {
+            disconnect(tunnel: tunnel, onStatusChange: session.onStatusChange)
+        }
+    }
 
-        Task {
-            // Check if port is already in use and kill it
-            if let existingPid = portInUse(tunnel.localPort) {
-                print("⚠️ Port \(tunnel.localPort) already in use by PID \(existingPid) — killing it")
-                kill(existingPid, SIGKILL)
-                try? await Task.sleep(nanoseconds: 500_000_000)
-            }
-
-            // Resolve instance ID if Name tag was given
-            let target: String
-            if tunnel.ssmTarget.hasPrefix("i-") {
-                target = tunnel.ssmTarget
-            } else {
-                guard let resolved = await resolveNameTag(tunnel: tunnel) else {
-                    await MainActor.run { onStatusChange(.stopped) }
+    private func start(_ session: Session, retrying: Bool) {
+        session.work = Task { [weak self, weak session] in
+            guard let self, let session, isActive(session) else { return }
+            let tunnel = session.tunnel
+            if let existingPid = listeningPIDs(tunnel.localPort).first {
+                // Reconnects must wait for the port rather than evict another process.
+                if retrying {
+                    attemptEnded(session)
                     return
                 }
-                target = resolved
+                kill(existingPid, SIGKILL)
+                try? await Task.sleep(for: .milliseconds(500))
+                guard isActive(session) else { return }
+            }
+
+            let target = if tunnel.ssmTarget.hasPrefix("i-") {
+                tunnel.ssmTarget
+            } else {
+                await resolveNameTag(tunnel: tunnel)
+            }
+            guard isActive(session) else { return }
+            guard let target else {
+                attemptEnded(session)
+                return
             }
 
             let params = """
             {"host":["\(tunnel.remoteHost)"],"portNumber":["\(tunnel.remotePort)"],"localPortNumber":["\(tunnel.localPort)"]}
             """
-
-            var args = [
-                "aws", "ssm", "start-session",
-                "--target", target,
-                "--document-name", "AWS-StartPortForwardingSessionToRemoteHost",
-                "--parameters", params,
-                "--region", tunnel.region
-            ]
-            if !tunnel.profile.isEmpty {
-                args += ["--profile", tunnel.profile]
-            }
-
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = args
-
-            var env = ProcessInfo.processInfo.environment
-            env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:" + (env["PATH"] ?? "")
-            process.environment = env
-
-            let outPipe = Pipe()
-            let errPipe = Pipe()
-            process.standardOutput = outPipe
-            process.standardError = errPipe
-
-            process.terminationHandler = { [weak self] p in
-                print("❌ Process terminated: \(p.processIdentifier)")
-                self?.pids.removeValue(forKey: tunnel.id)
-                DispatchQueue.main.async { onStatusChange(.stopped) }
+            var args = ["ssm", "start-session", "--target", target,
+                        "--document-name", "AWS-StartPortForwardingSessionToRemoteHost",
+                        "--parameters", params, "--region", tunnel.region]
+            if !tunnel.profile.isEmpty { args += ["--profile", tunnel.profile] }
+            let process = Self.awsProcess(args: args)
+            // A retained session must not rely on pipes whose reader exits with the app.
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            process.terminationHandler = { [weak self, weak session] exited in
+                Task { @MainActor in
+                    guard let self, let session, self.isActive(session), session.process === exited else { return }
+                    self.processEnded(session, pid: exited.processIdentifier)
+                }
             }
 
             do {
                 try process.run()
-                let pid = process.processIdentifier
-                pids[tunnel.id] = pid
-                print("✅ Started SSM tunnel PID: \(pid)")
-
-                // Watch stdout for ready signal
-                Task {
-                    for try await line in outPipe.fileHandleForReading.bytes.lines {
-                        print("SSM OUT: \(line)")
-                        if line.contains("Waiting for connections") {
-                            await MainActor.run { onStatusChange(.connected) }
-                            return
-                        }
-                    }
-                }
-
-                // Fallback: mark connected after 3s if no stdout signal
-                try await Task.sleep(nanoseconds: 3_000_000_000)
-                if pids[tunnel.id] != nil {
-                    await MainActor.run { onStatusChange(.connected) }
-                }
-
+                session.process = process
+                await watchForListener(session)
             } catch {
-                print("❌ Failed to start process: \(error)")
-                pids.removeValue(forKey: tunnel.id)
-                await MainActor.run { onStatusChange(.stopped) }
+                debugLog("Failed to start SSM session: \(error)")
+                attemptEnded(session)
             }
         }
     }
 
-    // ── Disconnect ───────────────────────────────────────────
-    func disconnect(tunnel: Tunnel, onStatusChange: @escaping (TunnelStatus) -> Void) {
-        guard let pid = pids[tunnel.id] else {
-            print("⚠️ No PID found for tunnel \(tunnel.name)")
-            onStatusChange(.stopped)
+    private func watchForListener(_ session: Session) async {
+        let fallback = ContinuousClock.now.advanced(by: .seconds(3))
+        guard let pid = session.pid else { return }
+        while isActive(session), session.pid == pid {
+            guard session.process?.isRunning ?? (session.restored?.isCurrent == true) else { return }
+            if listeningPIDs(session.tunnel.localPort).contains(where: { getpgid($0) == pid })
+                || (!session.keepAlive && ContinuousClock.now >= fallback) {
+                session.onStatusChange(.connected)
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+    }
+
+    private func processEnded(_ session: Session, pid: Int32) {
+        stopOrphanedPlugin(for: session, group: pid)
+        session.process = nil
+        session.restored = nil
+        session.exitSource?.cancel()
+        session.exitSource = nil
+        attemptEnded(session)
+    }
+
+    private func attemptEnded(_ session: Session) {
+        session.work?.cancel()
+        guard session.keepAlive else {
+            remove(session)
+            session.onStatusChange(.stopped)
             return
         }
+        session.retryPending = true
+        session.onStatusChange(.starting)
+        session.work = Task { [weak self, weak session] in
+            try? await Task.sleep(for: .seconds(3))
+            guard let self, let session, !Task.isCancelled, isActive(session) else { return }
+            session.retryPending = false
+            start(session, retrying: true)
+        }
+    }
 
-        print("🛑 Killing PID \(pid) and group")
-        kill(-pid, SIGKILL)
-        kill(pid, SIGKILL)
-        pids.removeValue(forKey: tunnel.id)
+    func restore(tunnel: Tunnel, onStatusChange: @escaping (TunnelStatus) -> Void) {
+        guard !isShuttingDown, sessions[tunnel.id] == nil,
+              let identity = retained.removeValue(forKey: tunnel.id.uuidString) else { return }
+        saveRetained()
+        guard identity.isCurrent else { return }
+
+        let session = Session(tunnel: tunnel, onStatusChange: onStatusChange)
+        session.restored = identity
+        sessions[tunnel.id] = session
+        session.onStatusChange(.starting)
+        let source = DispatchSource.makeProcessSource(identifier: identity.pid, eventMask: .exit, queue: .main)
+        let handleExit = { [weak self, weak session] in
+            Task { @MainActor in
+                guard let self, let session, self.isActive(session), session.restored == identity else { return }
+                self.processEnded(session, pid: identity.pid)
+            }
+        }
+        source.setEventHandler { _ = handleExit() }
+        source.setRegistrationHandler {
+            if !identity.isCurrent { _ = handleExit() }
+        }
+        session.exitSource = source
+        source.resume()
+        session.work = Task { [weak self, weak session] in
+            guard let self, let session else { return }
+            await watchForListener(session)
+        }
+    }
+
+    func disconnect(tunnel: Tunnel, onStatusChange: (TunnelStatus) -> Void) {
+        if let session = sessions[tunnel.id] {
+            remove(session)
+            stopProcess(session)
+        }
         onStatusChange(.stopped)
     }
 
-    // ── Disconnect all ───────────────────────────────────────
     func disconnectAll() {
-        print("🛑 Disconnecting all tunnels: \(pids)")
-        for (_, pid) in pids {
+        guard !isShuttingDown else { return }
+        isShuttingDown = true
+        let active = Array(sessions.values)
+        for session in active {
+            remove(session)
+            if session.keepAlive {
+                let identity = session.restored ?? session.pid.flatMap(ProcessIdentity.read)
+                if let identity, identity.isCurrent {
+                    retained[session.id.uuidString] = identity
+                }
+            } else {
+                stopProcess(session)
+            }
+        }
+        retained = retained.filter { $0.value.isCurrent }
+        saveRetained()
+
+        // The legacy fallback would also kill sessions marked to survive either quit.
+        if retained.isEmpty && !active.contains(where: \.keepAlive) {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+            task.arguments = ["-9", "-f", "ssm start-session"]
+            if (try? task.run()) != nil { task.waitUntilExit() }
+        }
+    }
+
+    private func saveRetained() {
+        if retained.isEmpty {
+            UserDefaults.appDefaults.removeObject(forKey: retainedKey)
+        } else if let data = try? JSONEncoder().encode(retained) {
+            UserDefaults.appDefaults.set(data, forKey: retainedKey)
+        }
+    }
+
+    private func isActive(_ session: Session) -> Bool {
+        !isShuttingDown && !Task.isCancelled && sessions[session.id] === session
+    }
+
+    private func remove(_ session: Session) {
+        sessions.removeValue(forKey: session.id)
+        session.work?.cancel()
+        session.exitSource?.cancel()
+    }
+
+    private func stopProcess(_ session: Session) {
+        guard let pid = session.pid else { return }
+        if session.process?.isRunning ?? (session.restored?.isCurrent == true) {
             kill(-pid, SIGKILL)
             kill(pid, SIGKILL)
+        } else {
+            stopOrphanedPlugin(for: session, group: pid)
         }
-        pids.removeAll()
-
-        // Nuclear fallback
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        task.arguments = ["-9", "-f", "ssm start-session"]
-        try? task.run()
-        task.waitUntilExit()
     }
 
-    // ── Register an existing tunnel found on launch ──────────
-    func registerExisting(tunnel: Tunnel, pid: Int32) {
-        pids[tunnel.id] = pid
-        print("📌 Registered existing tunnel \(tunnel.name) PID \(pid)")
+    private func stopOrphanedPlugin(for session: Session, group: Int32) {
+        // Match the listener to the original group and rule out a reused leader PID.
+        guard getpgid(group) == -1 || session.restored?.isCurrent == true,
+              listeningPIDs(session.tunnel.localPort).contains(where: { getpgid($0) == group }) else { return }
+        kill(-group, SIGKILL)
     }
 
-    // ── Check if port is already in use (public) ─────────────
-    // Only returns the LISTENING process — ignores clients like DBeaver
-    func portInUse(_ port: Int) -> Int32? {
+    private func listeningPIDs(_ port: Int) -> [Int32] {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
         process.arguments = ["-i", "tcp:\(port)", "-s", "TCP:LISTEN", "-t"]
+        return Self.output(of: process).split(whereSeparator: \.isNewline).compactMap { Int32($0) }
+    }
 
+    private func resolveNameTag(tunnel: Tunnel) async -> String? {
+        var args = ["ec2", "describe-instances", "--filters", "Name=tag:Name,Values=\(tunnel.ssmTarget)",
+                    "--query", "Reservations[0].Instances[0].InstanceId", "--output", "text", "--region", tunnel.region]
+        if !tunnel.profile.isEmpty { args += ["--profile", tunnel.profile] }
+        let result = await Task.detached(priority: .utility) { [args] in
+            Self.output(of: Self.awsProcess(args: args))
+        }.value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return result.isEmpty || result == "None" ? nil : result
+    }
+
+    private nonisolated static func awsProcess(args: [String]) -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["aws"] + args
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:" + (environment["PATH"] ?? "")
+        process.environment = environment
+        return process
+    }
+
+    private nonisolated static func output(of process: Process) -> String {
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
-
-        try? process.run()
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return "" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-
-        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-        return Int32(output.split(separator: "\n").first ?? "")
-    }
-
-    // ── Resolve EC2 Name tag → instance ID ───────────────────
-    private func resolveNameTag(tunnel: Tunnel) async -> String? {
-        var args = [
-            "ec2", "describe-instances",
-            "--filters", "Name=tag:Name,Values=\(tunnel.ssmTarget)",
-            "--query", "Reservations[0].Instances[0].InstanceId",
-            "--output", "text",
-            "--region", tunnel.region
-        ]
-        if !tunnel.profile.isEmpty { args += ["--profile", tunnel.profile] }
-
-        let result = await run("aws", args: args)
-        let id = result.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (id.isEmpty || id == "None") ? nil : id
-    }
-
-    // ── Generic process runner ────────────────────────────────
-    @discardableResult
-    private func run(_ command: String, args: [String]) async -> String {
-        await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = [command] + args
-
-            var env = ProcessInfo.processInfo.environment
-            env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:" + (env["PATH"] ?? "")
-            process.environment = env
-
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = Pipe()
-
-            do {
-                try process.run()
-                process.waitUntilExit()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                continuation.resume(returning: String(data: data, encoding: .utf8) ?? "")
-            } catch {
-                continuation.resume(returning: "")
-            }
-        }
+        return String(decoding: data, as: UTF8.self)
     }
 }

@@ -5,7 +5,8 @@ struct TunnelRowView: View {
     var onToggle: () -> Void = {}
     var onEdit: () -> Void = {}
     var onDelete: () -> Void = {}
-       
+    var onKeepAliveToggle: () -> Void = {}
+
     @State private var isHovered = false
 
     var body: some View {
@@ -43,9 +44,17 @@ struct TunnelRowView: View {
 
             Spacer()
 
+            Toggle("Keep alive", isOn: Binding(
+                get: { tunnel.keepAlive },
+                set: { if $0 != tunnel.keepAlive { onKeepAliveToggle() } }
+            ))
+            .toggleStyle(.checkbox)
+            .labelsHidden()
+            .help("Keep alive: reconnect after a drop while iamtunnel is open and leave the tunnel running on quit.")
+
             // ── Pill on hover ────────────────────────────────────
-            if isHovered && tunnel.status != .starting {
-                Text(tunnel.status == .connected ? "Stop" : "Connect")
+            if isHovered && (tunnel.status != .starting || tunnel.keepAlive) {
+                Text(tunnel.status == .stopped ? "Connect" : "Stop")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.primary)
                     .padding(.horizontal, 13)
@@ -63,6 +72,7 @@ struct TunnelRowView: View {
         .frame(maxWidth: .infinity)
         .contextMenu {
             Button("Edit…") { onEdit() }
+            Button(tunnel.keepAlive ? "Turn off keep alive" : "Turn on keep alive") { onKeepAliveToggle() }
             Divider()
             Button("Delete", role: .destructive) { onDelete() }
         }

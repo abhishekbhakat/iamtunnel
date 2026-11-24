@@ -11,7 +11,7 @@ func debugLog(_ message: String) {
 class AppDelegate: NSObject, NSApplicationDelegate {
 
     var statusItem: NSStatusItem?
-    var popover: NSPopover?
+    private let popover = NSPopover()
     var settingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -34,11 +34,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.action = #selector(togglePopover)
         }
 
-        // 2. Create the popover
-        popover = NSPopover()
-        popover?.contentSize = NSSize(width: 320, height: 360)
-        popover?.behavior = .transient
-        popover?.contentViewController = NSHostingController(rootView: TunnelListView())
+        // 2. Configure the popover
+        let hosting = NSHostingController(rootView: TunnelListView())
+        hosting.sizingOptions = []
+        popover.contentViewController = hosting
+        popover.contentSize = NSSize(width: 320, height: 360)
+        popover.behavior = .transient
 
         // 3. Observe active tunnel count changes
         NotificationCenter.default.addObserver(
@@ -77,12 +78,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func togglePopover() {
         guard let button = statusItem?.button else { return }
-        if popover?.isShown == true {
-            popover?.performClose(nil)
+        if popover.isShown {
+            popover.performClose(nil)
         } else {
-            popover?.contentViewController = NSHostingController(rootView: TunnelListView())
-            popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            popover?.contentViewController?.view.window?.makeKey()
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
         }
     }
 

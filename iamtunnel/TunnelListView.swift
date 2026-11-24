@@ -4,36 +4,43 @@ struct TunnelListView: View {
     @State private var tunnels: [Tunnel] = ConnectionStore.shared.load()
     @State private var connectionWindow: NSWindow?
     @State private var editWindow: NSWindow?
-    @State private var depStatus: DependencyStatus = DependencyStatus()
-
-    // ── Dynamic height calculation ───────────────────────────
-    private let rowHeight: CGFloat = 52
-    private let baseHeight: CGFloat = 130  // header + footer + labels
-    private let maxHeight: CGFloat = 480
-    private let emptyHeight: CGFloat = 250
-
-    private var popoverHeight: CGFloat {
-        if tunnels.isEmpty { return emptyHeight }
-        let depHeight: CGFloat = depStatus.allGood ? 0 : 44
-        return min(baseHeight + depHeight + CGFloat(tunnels.count) * rowHeight, maxHeight)
-    }
+    @State private var depStatus: DependencyStatus?
 
     var body: some View {
         VStack(spacing: 0) {
-            Color.clear.frame(height: 4)
+            ScrollView {
+                tunnelContent
+                    .padding(.vertical, 8)
+            }
+            .scrollBounceBehavior(.basedOnSize)
 
-            // ── Dependency warning ───────────────────────────
-            if !depStatus.allGood {
+            Divider()
+            footer
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            debugLog("👀 TunnelListView appeared")
+            restoreExistingTunnels()
+            postActiveCount()
+        }
+        .task {
+            let status = await DependencyChecker.shared.check()
+            guard !Task.isCancelled else { return }
+            depStatus = status
+        }
+    }
+
+    private var tunnelContent: some View {
+        VStack(spacing: 0) {
+            if let depStatus, !depStatus.allGood {
                 DependencyWarningView(status: depStatus)
                 Divider()
             }
 
-            // ── New connection ───────────────────────────────
             NewConnectionRow { openNewConnectionWindow() }
-
             Divider()
 
-            // ── Tunnels label ────────────────────────────────
             Text("Tunnels")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.secondary)
@@ -42,7 +49,6 @@ struct TunnelListView: View {
                 .padding(.top, 8)
                 .padding(.bottom, 2)
 
-            // ── Empty state ──────────────────────────────────
             if tunnels.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "point.3.connected.trianglepath.dotted")
@@ -58,75 +64,60 @@ struct TunnelListView: View {
                 .frame(maxWidth: .infinity)
                 .frame(height: 140)
             } else {
-                ForEach(tunnels.indices, id: \.self) { i in
-                    TunnelRowView(tunnel: tunnels[i]) {
-                        toggleTunnel(at: i)
+                ForEach(tunnels) { tunnel in
+                    TunnelRowView(tunnel: tunnel) {
+                        toggleTunnel(tunnel)
                     } onEdit: {
-                        openEditWindow(for: tunnels[i])
+                        openEditWindow(for: tunnel)
                     } onDelete: {
-                        tunnels.remove(at: i)
+                        TunnelManager.shared.disconnect(tunnel: tunnel) { _ in }
+                        tunnels.removeAll { $0.id == tunnel.id }
                         ConnectionStore.shared.save(tunnels)
-                        updatePopoverSize()
+                        postActiveCount()
+                    } onKeepAliveToggle: {
+                        toggleKeepAlive(for: tunnel.id)
                     }
                 }
             }
+        }
+    }
 
+    private var footer: some View {
+        HStack {
+            Button("Settings...") {
+                (NSApp.delegate as? AppDelegate)?.openSettings()
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 13.5))
+            .foregroundStyle(.primary)
             Spacer()
-            Divider()
+            Button("Quit") {
+                NSApp.terminate(nil)
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 13.5))
+            .foregroundStyle(.primary)
+            Text("⌘Q")
+                .font(.system(size: 12))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
 
-            // ── Footer ───────────────────────────────────────
-            HStack {
-                Button("Settings...") {
-                    (NSApp.delegate as? AppDelegate)?.openSettings()
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 13.5))
-                .foregroundStyle(.primary)
-                Spacer()
-                Button("Quit") {
-                    TunnelManager.shared.disconnectAll()
-                    NSApp.terminate(nil)
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 13.5))
-                .foregroundStyle(.primary)
-                Text("⌘Q")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.tertiary)
+    private func restoreExistingTunnels() {
+        for tunnel in tunnels where tunnel.status == .stopped {
+            TunnelManager.shared.restore(tunnel: tunnel) { newStatus in
+                updateStatus(of: tunnel, to: newStatus)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear {
-            debugLog("👀 TunnelListView appeared")
-            depStatus = DependencyChecker.shared.check()
-            updatePopoverSize()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                detectExistingTunnels()
-                postActiveCount()
-            }
-        }
-        .onChange(of: tunnels.count) { _ in
-            updatePopoverSize()
         }
     }
 
-    // ── Resize popover to fit content ────────────────────────
-    private func updatePopoverSize() {
-        let delegate = NSApp.delegate as? AppDelegate
-        delegate?.popover?.contentSize = NSSize(width: 320, height: popoverHeight)
-    }
-
-    // ── Detect tunnels already running on launch ─────────────
-    private func detectExistingTunnels() {
-        for i in tunnels.indices {
-            if let pid = TunnelManager.shared.portInUse(tunnels[i].localPort) {
-                debugLog("🔍 Found existing process on port \(tunnels[i].localPort) PID \(pid)")
-                tunnels[i].status = .connected
-                TunnelManager.shared.registerExisting(tunnel: tunnels[i], pid: pid)
-            }
-        }
+    private func toggleKeepAlive(for id: UUID) {
+        guard let index = tunnels.firstIndex(where: { $0.id == id }) else { return }
+        tunnels[index].keepAlive.toggle()
+        ConnectionStore.shared.save(tunnels)
+        TunnelManager.shared.updateKeepAlive(for: tunnels[index])
     }
 
     // ── Open new connection window ───────────────────────────
@@ -141,14 +132,7 @@ struct TunnelListView: View {
                 connectionWindow?.close()
                 connectionWindow = nil
             }
-            let hosting = NSHostingController(rootView: view)
-            let window = NSWindow(contentViewController: hosting)
-            window.title = "New Connection"
-            window.styleMask = NSWindow.StyleMask([.titled, .closable])
-            window.setContentSize(NSSize(width: 400, height: 420))
-            window.isReleasedWhenClosed = false
-            window.center()
-            connectionWindow = window
+            connectionWindow = makeConnectionWindow(for: view, title: "New Connection")
         }
         connectionWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -161,8 +145,11 @@ struct TunnelListView: View {
 
         let view = NewConnectionView(editing: tunnel) { updated in
             if let i = tunnels.firstIndex(where: { $0.id == updated.id }) {
+                var updated = updated
+                updated.status = tunnels[i].status
                 tunnels[i] = updated
                 ConnectionStore.shared.save(tunnels)
+                TunnelManager.shared.updateKeepAlive(for: updated)
             }
             editWindow?.close()
             editWindow = nil
@@ -170,39 +157,45 @@ struct TunnelListView: View {
             editWindow?.close()
             editWindow = nil
         }
-        let hosting = NSHostingController(rootView: view)
-        let window = NSWindow(contentViewController: hosting)
-        window.title = "Edit Connection"
-        window.styleMask = NSWindow.StyleMask([.titled, .closable])
-        window.setContentSize(NSSize(width: 400, height: 420))
-        window.isReleasedWhenClosed = false
-        window.center()
-        editWindow = window
+        editWindow = makeConnectionWindow(for: view, title: "Edit Connection")
         editWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    private func makeConnectionWindow(for view: NewConnectionView, title: String) -> NSWindow {
+        let hosting = NSHostingController(rootView: view)
+        hosting.sizingOptions = []
+        let window = NSWindow(contentViewController: hosting)
+        window.title = title
+        window.styleMask = [.titled, .closable]
+        window.setContentSize(NewConnectionView.windowContentSize)
+        window.isReleasedWhenClosed = false
+        window.center()
+        return window
+    }
+
     // ── Toggle tunnel connect/disconnect ─────────────────────
-    private func toggleTunnel(at index: Int) {
-        let tunnel = tunnels[index]
-        switch tunnel.status {
-        case .stopped:
+    private func toggleTunnel(_ tunnel: Tunnel) {
+        if tunnel.status == .stopped {
             TunnelManager.shared.connect(tunnel: tunnel) { newStatus in
-                tunnels[index].status = newStatus
-                if newStatus == .connected {
-                    NotificationManager.shared.notifyConnected(tunnel: tunnel)
-                }
-                postActiveCount()
+                updateStatus(of: tunnel, to: newStatus)
             }
-        case .connected:
+        } else {
             TunnelManager.shared.disconnect(tunnel: tunnel) { newStatus in
-                tunnels[index].status = newStatus
+                updateStatus(of: tunnel, to: newStatus)
                 NotificationManager.shared.notifyDisconnected(tunnel: tunnel)
-                postActiveCount()
             }
-        case .starting:
-            break
         }
+    }
+
+    private func updateStatus(of tunnel: Tunnel, to status: TunnelStatus) {
+        guard let index = tunnels.firstIndex(where: { $0.id == tunnel.id }),
+              tunnels[index].status != status else { return }
+        tunnels[index].status = status
+        if status == .connected {
+            NotificationManager.shared.notifyConnected(tunnel: tunnel)
+        }
+        postActiveCount()
     }
 
     // ── Post active tunnel count to menu bar icon ────────────

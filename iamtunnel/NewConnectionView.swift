@@ -1,6 +1,8 @@
 import SwiftUI
 
 struct NewConnectionView: View {
+    static let windowContentSize = NSSize(width: 460, height: 460)
+
     var editing: Tunnel? = nil
     var onSave: (Tunnel) -> Void
     var onCancel: () -> Void = {}
@@ -13,6 +15,7 @@ struct NewConnectionView: View {
     @State private var remotePort = ""
     @State private var localPort  = ""
     @State private var env        = TunnelEnv.dev
+    @State private var keepAlive  = false
     @State private var testResult = TestResult.idle
 
     private let awsProfiles = AWSConfigReader.shared.profileNames
@@ -30,6 +33,7 @@ struct NewConnectionView: View {
             _remotePort = State(initialValue: String(t.remotePort))
             _localPort  = State(initialValue: String(t.localPort))
             _env        = State(initialValue: t.env)
+            _keepAlive  = State(initialValue: t.keepAlive)
         }
     }
 
@@ -62,158 +66,175 @@ struct NewConnectionView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-
-            // ── Form ─────────────────────────────────────────────
-            VStack(spacing: 12) {
-
-                HStack(spacing: 10) {
-                    FormField(label: "Name", placeholder: "Production Postgres") {
-                        TextField("", text: $name)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 13))
-                    }
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("Env")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.secondary)
-                        Picker("", selection: $env) {
-                            Text("prod").tag(TunnelEnv.production)
-                            Text("stage").tag(TunnelEnv.staging)
-                            Text("dev").tag(TunnelEnv.dev)
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(width: 110)
-                    }
-                }
-
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("AWS profile")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.secondary)
-                        Menu(profile) {
-                            ForEach(awsProfiles, id: \.self) { p in
-                                Button(p) {
-                                    profile = p
-                                    if let r = AWSConfigReader.shared.region(for: p) {
-                                        region = r
-                                    }
-                                }
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 6)
-                        .background(Color(nsColor: .controlBackgroundColor))
-                        .clipShape(RoundedRectangle(cornerRadius: 7))
-                        .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.1), lineWidth: 0.5))
-                    }
-                    FormField(label: "Region", placeholder: "us-east-1") {
-                        TextField("", text: $region)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 13))
-                    }
-                }
-
-                FormField(label: "SSM target", placeholder: "i-0abc123def456 or my-bastion") {
-                    TextField("", text: $ssmTarget)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13, design: .monospaced))
-                }
-
-                HStack(spacing: 10) {
-                    FormField(label: "Remote host", placeholder: "mydb.cluster.internal") {
-                        TextField("", text: $remoteHost)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 13, design: .monospaced))
-                            .onChange(of: remoteHost) { host in
-                                if let detected = extractRegion(from: host), region == "us-east-1" || region.isEmpty {
-                                    region = detected
-                                }
-                            }
-                    }
-                    FormField(label: "Remote port", placeholder: "5432") {
-                        TextField("", text: $remotePort)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 13, design: .monospaced))
-                    }
-                    .frame(width: 80)
-                }
-
-                FormField(label: "Local port", placeholder: "15432") {
-                    TextField("", text: $localPort)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13, design: .monospaced))
-                }
-
-                // ── Duplicate warning ────────────────────────────
-                if let msg = duplicateMessage {
-                    Label(msg, systemImage: "exclamationmark.triangle.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.orange)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                // ── Test result message ──────────────────────────
-                if case .testing = testResult {
-                    HStack(spacing: 6) {
-                        ProgressView().scaleEffect(0.6)
-                        Text("Testing connection…")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                } else if case .success(let msg) = testResult {
-                    Label(msg, systemImage: "checkmark.circle.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.green)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else if case .failure(let msg) = testResult {
-                    Label(msg, systemImage: "xmark.circle.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.red)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+            ScrollView {
+                form
+                    .padding(16)
             }
-            .padding(16)
+            .scrollBounceBehavior(.basedOnSize)
 
             Divider()
-
-            // ── Footer ───────────────────────────────────────────
-            HStack {
-                Button("Cancel") { onCancel() }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-
-                Spacer()
-
-                // Test button
-                Button(action: runTest) {
-                    Text("Test connection")
-                        .font(.system(size: 13))
-                        .foregroundStyle(isValid ? Color.accentColor : Color.secondary)
-                }
-                .buttonStyle(.plain)
-                .disabled(!isValid)
-
-                // Save button
-                Button(action: save) {
-                    Text(editing == nil ? "Save" : "Update")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 6)
-                        .background(isValid ? Color.accentColor : Color.accentColor.opacity(0.4))
-                        .clipShape(RoundedRectangle(cornerRadius: 7))
-                }
-                .buttonStyle(.plain)
-                .disabled(!isValid)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
+            footer
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .frame(width: 400)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var form: some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 10) {
+                FormField(label: "Name") {
+                    TextField("Name", text: $name, prompt: Text("Production Postgres"))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13))
+                }
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Env")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Picker("Env", selection: $env) {
+                        Text("prod").tag(TunnelEnv.production)
+                        Text("stage").tag(TunnelEnv.staging)
+                        Text("dev").tag(TunnelEnv.dev)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .fixedSize(horizontal: true, vertical: false)
+                }
+            }
+
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("AWS profile")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Menu {
+                        ForEach(awsProfiles, id: \.self) { p in
+                            Button(p) {
+                                profile = p
+                                if let r = AWSConfigReader.shared.region(for: p) {
+                                    region = r
+                                }
+                            }
+                        }
+                    } label: {
+                        Text(profile)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.1), lineWidth: 0.5))
+                }
+                FormField(label: "Region") {
+                    TextField("Region", text: $region, prompt: Text("us-east-1"))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13))
+                }
+            }
+
+            FormField(label: "SSM target") {
+                TextField("SSM target", text: $ssmTarget, prompt: Text("i-0abc123def456 or my-bastion"))
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13, design: .monospaced))
+            }
+
+            HStack(spacing: 10) {
+                FormField(label: "Remote host") {
+                    TextField("Remote host", text: $remoteHost, prompt: Text("mydb.cluster.internal"))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13, design: .monospaced))
+                        .onChange(of: remoteHost) { host in
+                            if let detected = extractRegion(from: host), region == "us-east-1" || region.isEmpty {
+                                region = detected
+                            }
+                        }
+                }
+                FormField(label: "Remote port") {
+                    TextField("Remote port", text: $remotePort, prompt: Text("5432"))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13, design: .monospaced))
+                }
+                .frame(width: 80)
+            }
+
+            FormField(label: "Local port") {
+                TextField("Local port", text: $localPort, prompt: Text("15432"))
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13, design: .monospaced))
+            }
+
+            Toggle("Keep alive", isOn: $keepAlive)
+                .toggleStyle(.checkbox)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help("Reconnect after a drop while iamtunnel is open and leave the tunnel running on quit.")
+
+            // ── Duplicate warning ────────────────────────────
+            if let msg = duplicateMessage {
+                Label(msg, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            // ── Test result message ──────────────────────────
+            if case .testing = testResult {
+                HStack(spacing: 6) {
+                    ProgressView().scaleEffect(0.6)
+                    Text("Testing connection…")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else if case .success(let msg) = testResult {
+                Label(msg, systemImage: "checkmark.circle.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.green)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if case .failure(let msg) = testResult {
+                Label(msg, systemImage: "xmark.circle.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 12) {
+            Button("Cancel") { onCancel() }
+                .buttonStyle(.plain)
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            // Test button
+            Button(action: runTest) {
+                Text("Test connection")
+                    .font(.system(size: 13))
+                    .foregroundStyle(isValid ? Color.accentColor : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(!isValid)
+
+            // Save button
+            Button(action: save) {
+                Text(editing == nil ? "Save" : "Update")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(isValid ? Color.accentColor : Color.accentColor.opacity(0.4))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+            }
+            .buttonStyle(.plain)
+            .disabled(!isValid)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
     }
 
     private func runTest() {
@@ -249,7 +270,7 @@ struct NewConnectionView: View {
             ssmTarget: ssmTarget, remoteHost: remoteHost,
             remotePort: Int(remotePort) ?? 0,
             localPort: Int(localPort) ?? 0,
-            env: env, status: editing?.status ?? .stopped
+            env: env, status: editing?.status ?? .stopped, keepAlive: keepAlive
         )
     }
 }
@@ -257,7 +278,6 @@ struct NewConnectionView: View {
 // ── Reusable form field ──────────────────────────────────────
 struct FormField<Content: View>: View {
     let label: String
-    let placeholder: String
     @ViewBuilder let content: () -> Content
 
     var body: some View {
@@ -268,7 +288,7 @@ struct FormField<Content: View>: View {
             content()
                 .padding(.horizontal, 9)
                 .padding(.vertical, 6)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                 .background(Color(nsColor: .controlBackgroundColor))
                 .clipShape(RoundedRectangle(cornerRadius: 7))
                 .overlay(
@@ -276,10 +296,12 @@ struct FormField<Content: View>: View {
                         .stroke(Color.primary.opacity(0.1), lineWidth: 0.5)
                 )
         }
-        .frame(maxWidth: .infinity)
+        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
     }
 }
 
 #Preview {
+    let size = NewConnectionView.windowContentSize
     NewConnectionView(onSave: { _ in })
+        .frame(width: size.width, height: size.height)
 }

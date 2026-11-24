@@ -47,11 +47,13 @@ struct Tunnel: Identifiable, Codable {
     var localPort: Int
     var env: TunnelEnv
     var status: TunnelStatus
+    var keepAlive: Bool
 
     init(id: UUID = UUID(), name: String, profile: String = "default",
          region: String = "us-east-1", ssmTarget: String,
          remoteHost: String, remotePort: Int, localPort: Int,
-         env: TunnelEnv = .dev, status: TunnelStatus = .stopped) {
+         env: TunnelEnv = .dev, status: TunnelStatus = .stopped,
+         keepAlive: Bool = false) {
         self.id = id
         self.name = name
         self.profile = profile
@@ -62,9 +64,33 @@ struct Tunnel: Identifiable, Codable {
         self.localPort = localPort
         self.env = env
         self.status = status
+        self.keepAlive = keepAlive
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            id: values.decode(UUID.self, forKey: .id),
+            name: values.decode(String.self, forKey: .name),
+            profile: values.decode(String.self, forKey: .profile),
+            region: values.decode(String.self, forKey: .region),
+            ssmTarget: values.decode(String.self, forKey: .ssmTarget),
+            remoteHost: values.decode(String.self, forKey: .remoteHost),
+            remotePort: values.decode(Int.self, forKey: .remotePort),
+            localPort: values.decode(Int.self, forKey: .localPort),
+            env: values.decode(TunnelEnv.self, forKey: .env),
+            status: values.decode(TunnelStatus.self, forKey: .status),
+            keepAlive: values.decodeIfPresent(Bool.self, forKey: .keepAlive) ?? false
+        )
     }
 
     var localAddress: String { "localhost:\(localPort)" }
+
+    func usesSameEndpoint(as other: Tunnel) -> Bool {
+        profile == other.profile && region == other.region && ssmTarget == other.ssmTarget
+            && remoteHost == other.remoteHost && remotePort == other.remotePort
+            && localPort == other.localPort
+    }
 }
 
 extension Tunnel {

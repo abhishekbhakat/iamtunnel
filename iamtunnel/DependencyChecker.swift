@@ -1,6 +1,6 @@
 import Foundation
 
-struct DependencyStatus {
+struct DependencyStatus: Sendable {
     var awsCLI: Bool = false
     var awsCLIVersion: String = ""
     var awsCredentials: Bool = false
@@ -12,10 +12,24 @@ struct DependencyStatus {
     }
 }
 
-class DependencyChecker {
+final class DependencyChecker: @unchecked Sendable {
     static let shared = DependencyChecker()
 
-    func check() -> DependencyStatus {
+    private let queue = DispatchQueue(label: "iamtunnel.dependencies", qos: .utility)
+    // The serial queue owns all reads and writes to the cache.
+    private var awsVersionCache: (path: String, checkedAt: ContinuousClock.Instant, version: String)?
+
+    private init() {}
+
+    func check() async -> DependencyStatus {
+        await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume(returning: self.probeDependencies())
+            }
+        }
+    }
+
+    private func probeDependencies() -> DependencyStatus {
         print("🔍 DependencyChecker.check() called")
         var status = DependencyStatus()
 
@@ -28,13 +42,14 @@ class DependencyChecker {
             "/opt/local/bin/aws"
         ]
         if let awsPath = awsPaths.first(where: { FileManager.default.fileExists(atPath: $0) }) {
-            let awsResult = run(awsPath, args: ["--version"])
+            let awsResult = awsVersion(at: awsPath)
             print("🔍 AWS CLI check: \(awsResult)")
             if awsResult.contains("aws-cli") {
                 status.awsCLI = true
                 status.awsCLIVersion = awsResult.components(separatedBy: " ").first ?? ""
             }
         } else {
+            awsVersionCache = nil
             print("🔍 AWS CLI not found in any known path")
         }
 
@@ -70,6 +85,17 @@ class DependencyChecker {
         return status
     }
 
+    private func awsVersion(at path: String) -> String {
+        if let cache = awsVersionCache, cache.path == path,
+           cache.checkedAt.duration(to: .now) < .seconds(60) {
+            return cache.version
+        }
+
+        let version = run(path, args: ["--version"])
+        awsVersionCache = (path, .now, version)
+        return version
+    }
+
     private func run(_ command: String, args: [String]) -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: command)
@@ -80,15 +106,12 @@ class DependencyChecker {
         process.environment = env
 
         let pipe = Pipe()
-        let errPipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = errPipe
+        process.standardError = pipe
 
-        try? process.run()
+        guard (try? process.run()) != nil else { return "" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return (out + err).trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
