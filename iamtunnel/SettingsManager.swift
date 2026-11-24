@@ -8,6 +8,10 @@
 import Foundation
 import ServiceManagement
 
+extension UserDefaults {
+    static let appDefaults = UserDefaults(suiteName: Bundle.main.bundleIdentifier) ?? .standard
+}
+
 class SettingsManager: ObservableObject {
     static let shared = SettingsManager()
 
@@ -16,22 +20,22 @@ class SettingsManager: ObservableObject {
     }
 
     @Published var notifyOnConnect: Bool = true {
-        didSet { UserDefaults.standard.set(notifyOnConnect, forKey: "notifyOnConnect") }
+        didSet { UserDefaults.appDefaults.set(notifyOnConnect, forKey: "notifyOnConnect") }
     }
 
     @Published var notifyOnDisconnect: Bool = true {
-        didSet { UserDefaults.standard.set(notifyOnDisconnect, forKey: "notifyOnDisconnect") }
+        didSet { UserDefaults.appDefaults.set(notifyOnDisconnect, forKey: "notifyOnDisconnect") }
     }
 
     @Published var showActiveCount: Bool = true {
-        didSet { UserDefaults.standard.set(showActiveCount, forKey: "showActiveCount") }
+        didSet { UserDefaults.appDefaults.set(showActiveCount, forKey: "showActiveCount") }
     }
 
     init() {
         // Load saved preferences
-        notifyOnConnect    = UserDefaults.standard.object(forKey: "notifyOnConnect")    as? Bool ?? true
-        notifyOnDisconnect = UserDefaults.standard.object(forKey: "notifyOnDisconnect") as? Bool ?? true
-        showActiveCount    = UserDefaults.standard.object(forKey: "showActiveCount")    as? Bool ?? true
+        notifyOnConnect    = UserDefaults.appDefaults.object(forKey: "notifyOnConnect")    as? Bool ?? true
+        notifyOnDisconnect = UserDefaults.appDefaults.object(forKey: "notifyOnDisconnect") as? Bool ?? true
+        showActiveCount    = UserDefaults.appDefaults.object(forKey: "showActiveCount")    as? Bool ?? true
 
         // Check current launch at login state
         if #available(macOS 13.0, *) {

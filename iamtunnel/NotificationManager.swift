@@ -15,7 +15,7 @@ class NotificationManager {
     }
 
     func notifyConnected(tunnel: Tunnel) {
-        guard UserDefaults.standard.object(forKey: "notifyOnConnect") as? Bool ?? true else { return }
+        guard UserDefaults.appDefaults.object(forKey: "notifyOnConnect") as? Bool ?? true else { return }
         send(
             title: "Tunnel connected",
             body: "\(tunnel.name) → \(tunnel.localAddress)",
@@ -24,7 +24,7 @@ class NotificationManager {
     }
 
     func notifyDisconnected(tunnel: Tunnel, unexpected: Bool = false) {
-        guard UserDefaults.standard.object(forKey: "notifyOnDisconnect") as? Bool ?? true else { return }
+        guard UserDefaults.appDefaults.object(forKey: "notifyOnDisconnect") as? Bool ?? true else { return }
         send(
             title: unexpected ? "Tunnel disconnected" : "Tunnel stopped",
             body: unexpected

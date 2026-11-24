@@ -7,7 +7,9 @@ class ConnectionStore {
         let appSupport = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
         ).first!
-        let dir = appSupport.appendingPathComponent("iamtunnel")
+        let folderName = Bundle.main.bundleIdentifier?
+            .split(separator: ".").last.map(String.init) ?? "iamtunnel"
+        let dir = appSupport.appendingPathComponent(folderName)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("connections.json")
     }()
